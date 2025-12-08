@@ -1,0 +1,265 @@
+import bz2
+import pandas as pd
+from collections import deque, defaultdict
+from datetime import datetime
+
+# ------------------------- CONFIG -------------------------
+VALID_VERSIONS = {
+    "5.0.0.34","5.0.0.46","5.1.0.2","5.4.0.14","5.4.0.100",
+    "5.6.0.6","5.6.0.14","7.0.0.16","7.1.0.2","7.1.0.28",
+    "7.1.0.64","7.2.0.50","7.4.0.4","7.5.0.20","7.6.0.2",
+    "7.6.0.4","7.6.0.24","7.7.0.100","8.0.0.8","8.1.0.2",
+    "8.1.0.4","8.1.0.18","8.1.0.22","8.2.0.72","8.3.0.16",
+    "9.1.0.16","9.1.0.46"
+}
+MAX_TIMESTAMP = 1767225600
+FILE_PATH = r"C:\Users\katsi\OneDrive\Business_Analytics\Thesis\Data\master-telemetry-sorted.bz2"
+OUTPUT_FILE = "error_rate.csv"
+MAX_ROWS = 5_000_000
+
+# ------------------------- WINDOW ACCUMULATOR -------------------------
+class WindowAccumulator:
+    def __init__(self, window_size):
+        self.window = deque()  # list of (timestamp, units) events
+        self.window_size = window_size # duration of the window in seconds
+        self.total = 0 # total units inside the window
+
+    def _evict(self, now): #evict events that are too old
+        cutoff = now - self.window_size
+        while self.window and self.window[0][0] < cutoff:
+            ts, units = self.window.popleft()
+            self.total -= units
+
+    def add(self, timestamp, units): #add events as you read them (one by one) & some up
+        self._evict(timestamp)
+        self.window.append((timestamp, units))
+        self.total += units
+
+    def get(self, now): # Make sure we evict based on the CURRENT time (upgrade timestamp)
+        self._evict(now)
+        #print(f"DEBUG: deque contents before get(): {[ts for ts, _ in self.window]}")
+        return self.total
+
+# ------------------------- USER STATS -------------------------
+class UserStats:
+    def __init__(self):
+        self.command_weekly = WindowAccumulator(7 * 86400)
+        self.activity_30d = deque()  # store (timestamp, date) of all activity events
+        ##average sessions per week
+        self.sessions = defaultdict(list)  # version -> list of (start_ts, end_ts)
+        self.current_session = {}  # version -> start_ts of ongoing session
+        self.crash_events = []  # <--- Add this to track crashes
+
+    def start_session(self, version, ts):
+        # If a previous session is still open for this version, close it with current timestamp
+        if version in self.current_session:
+            self.sessions[version].append((self.current_session[version], ts))
+        self.current_session[version] = ts
+
+    def end_session(self, version, ts):
+        if version in self.current_session:
+            self.sessions[version].append((self.current_session[version], ts))
+            del self.current_session[version]
+
+    def sessions_last_7d(self, version, now):
+        """Compute the average number of sessions per week in last 7 days for this version"""
+        cutoff = now - 7 * 86400
+        session_count = sum(1 for start, end in self.sessions[version] if start >= cutoff)
+        return session_count  # or divide by 1 to get "per week" if needed
+    ###
+    def add_event(self, ts):
+        # Add to weekly command counter (only if it's a Command/Param)
+        self.command_weekly.add(ts, 1)
+        # Track activity for 30 days
+        event_date = datetime.utcfromtimestamp(ts).date()
+        self.activity_30d.append((ts, event_date))
+        self._evict_old(ts)
+
+    def _evict_old(self, now_ts):
+        cutoff = now_ts - 30 * 86400
+        while self.activity_30d and self.activity_30d[0][0] < cutoff:
+            self.activity_30d.popleft()
+
+    def get_command_weekly(self, now):
+        return self.command_weekly.get(now)
+
+    def days_active_last_30(self, now):
+        self._evict_old(now)
+        return len({date for ts, date in self.activity_30d})
+
+    def total_usage_hours_last_7d(self, version, now_ts): #Sum session durations (hours) in last 7 days for the given version"""
+        start_window = now_ts - 7*86400
+        total_seconds = 0
+        for start, end in self.sessions.get(version, []):
+            if end is None:
+                end_time = min(now_ts, start + 7*86400)  # handle in-progress sessions
+            else:
+                end_time = end
+            overlap_start = max(start, start_window)
+            overlap_end = min(end_time, now_ts)
+            if overlap_end > overlap_start:
+                total_seconds += (overlap_end - overlap_start)
+        return total_seconds / 3600  # convert seconds → hours
+
+    def add_crash(self, ts):
+        self.crash_events.append(ts)
+
+    def crash_count_since(self, last_upgrade_ts, current_ts):
+        return sum(1 for ts in self.crash_events if last_upgrade_ts <= ts < current_ts)
+
+    #error_rate
+    def sessions_since(self, version, last_upgrade_ts, current_ts): #Count sessions that overlap with [last_upgrade_ts, current_ts) for this version
+        count = 0
+        for start, end in self.sessions.get(version, []):
+            if end is None:
+                end = current_ts
+            # Check if session overlaps with the interval
+            if end > last_upgrade_ts and start < current_ts:
+                count += 1
+        return count
+
+user_stats = {}
+user_versions_seen = {}
+version_tuple_cache = {}
+
+def get_user(user_id):
+    if user_id not in user_stats:
+        user_stats[user_id] = UserStats()
+    return user_stats[user_id]
+
+def parse_version(version):
+    if version not in version_tuple_cache:
+        version_tuple_cache[version] = tuple(map(int, version.split('.')))
+    return version_tuple_cache[version]
+
+# ------------------------- DATA CLEANING -------------------------
+def parse_line(line):
+    fields = line.rstrip("\n").split("\t")
+    if len(fields) < 4:
+        return None
+    try:
+        ts = int(float(fields[0]))
+        user_id = int(fields[1])
+        version = fields[2]
+        event_full = fields[3]
+    except:
+        return None
+    if ts >= MAX_TIMESTAMP or user_id < 0 or version not in VALID_VERSIONS:
+        return None
+    return ts, user_id, version, event_full
+
+seen_rows = set()
+
+def process_upgrade_row(ts, user_id, version, user, sessions_last_7d=0,
+                        total_usage_hours=0, crash_count=0, last_version_used=None,
+                        error_rate=0):
+    key = (ts, user_id, version, user.get_command_weekly(ts),
+           user.days_active_last_30(ts), sessions_last_7d, total_usage_hours)
+    if key not in seen_rows:
+        seen_rows.add(key)
+        return {
+            'timestamp': ts,
+            'user': user_id,
+            'version': version,
+            'command_param_count_weekly': user.get_command_weekly(ts),
+            'days_active_last_30': user.days_active_last_30(ts),
+            'sessions_last_7d': sessions_last_7d,
+            'total_usage_time_hours': total_usage_hours,
+            'crash_count': crash_count,
+            'last_version_used': last_version_used,
+            'error_rate': error_rate
+        }
+    return None
+
+# ------------------------- PROCESS FILE -------------------------
+CHUNK_SIZE = 100_000
+PROGRESS_INTERVAL = 1_000_000
+buffer_rows = []
+line_counter = 0
+header_written = False
+
+with bz2.open(FILE_PATH, "rt", encoding="utf-8") as f:
+    for line in f:
+        line_counter += 1
+        if line_counter > MAX_ROWS:
+            break
+        if line_counter % PROGRESS_INTERVAL == 0:
+            print(f"Processed {line_counter} rows...")
+
+        parsed = parse_line(line)
+        if parsed is None:
+            continue
+
+        ts, user_id, version, event_full = parsed
+        event_type = event_full.split(None, 1)[0] if event_full else None
+        user = get_user(user_id)
+
+        # Track activity for Command/Param events
+        if event_type in ("Command", "Param"):
+            user.add_event(ts)
+        
+        # Track Start events (upgrade) as activity too
+        if event_type == "Start":
+            user.add_event(ts)
+            #average sessions weekly
+            user.start_session(version, ts)  # start a session for this version
+            
+            # Upgrade detection
+            versions_seen = user_versions_seen.get(user_id, set())
+            current_version_tuple = parse_version(version)
+            is_upgrade = all(current_version_tuple > parse_version(v) for v in versions_seen) if versions_seen else False
+
+            # Determine previous version if upgrade
+            prev_version = max(versions_seen, key=parse_version) if versions_seen else None #average sessions weekly
+            versions_seen.add(version)
+            user_versions_seen[user_id] = versions_seen
+
+            if is_upgrade:
+                #average sessions weekly
+                # Compute avg sessions per week for the previous version
+                sessions_last_7d = user.sessions_last_7d(prev_version, ts) if prev_version else 0
+                total_usage_hours = user.total_usage_hours_last_7d(prev_version, ts) if prev_version else 0
+                total_usage_hours = round(total_usage_hours, 2)  # <-- round to 2 decimals
+
+                #compute crash count since last upgrade
+                last_upgrade_ts = user_versions_seen.get(f"{user_id}_last_upgrade_ts", 0)
+                crash_count = user.crash_count_since(last_upgrade_ts, ts)
+                #error_rate
+                sessions_count = user.sessions_since(prev_version, last_upgrade_ts, ts) if prev_version else 0
+                error_rate = crash_count / sessions_count if sessions_count > 0 else 0
+                error_rate = round(error_rate, 2)  # <-- round to 2 decimals
+
+                # update last upgrade timestamp for next iteration
+                user_versions_seen[f"{user_id}_last_upgrade_ts"] = ts
+
+                row = process_upgrade_row(
+                    ts, user_id, version, user,
+                    sessions_last_7d=sessions_last_7d,
+                    total_usage_hours=total_usage_hours,
+                    crash_count=crash_count,
+                    last_version_used=prev_version,
+                    error_rate=error_rate
+                )
+                if row is not None:
+                    buffer_rows.append(row)
+
+        elif event_type in ("End", "Crash"):
+            user.end_session(version, ts)
+            #crash_count
+            if event_type == "Crash":
+                user.add_crash(ts)
+
+        # Write CSV in chunks
+        if line_counter % CHUNK_SIZE == 0 and buffer_rows:
+            pd.DataFrame(buffer_rows).to_csv(
+                OUTPUT_FILE, mode='a', header=not header_written, index=False
+            )
+            header_written = True
+            buffer_rows = []
+
+if buffer_rows:
+    pd.DataFrame(buffer_rows).to_csv(
+        OUTPUT_FILE, mode='a', header=not header_written, index=False
+    )
+
+print(f"Finished processing {line_counter} rows. Upgrade events saved to {OUTPUT_FILE}")
